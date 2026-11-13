@@ -1,0 +1,9 @@
+LIBRARY MPR.dll
+EXPORTS
+    WNetOpenEnumA
+    WNetOpenEnumW
+    WNetEnumResourceA
+    WNetEnumResourceW
+    WNetCloseEnum
+    WNetGetUserA
+    WNetGetUserW
