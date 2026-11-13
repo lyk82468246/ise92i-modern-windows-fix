@@ -188,6 +188,40 @@ temporary files.
 | `createsch` / `sch2sym` / `asc2sch` | exit 19 + TEMP 消息 | exit 0，正常打印版本与 Usage |
 | `ise.exe` GUI | 正常 | 正常（无回归） |
 
+## 13. 第三幕："打了补丁连工程都打不开了？"——先查时间线
+
+补丁装上后用户反馈：所有 `.ise` 工程打不开、新建也一样，报 `ERROR:ProjectMgmt - A problem occurred while loading the project`。第一反应当然是自己闯祸了，于是做 A/B 取证：
+
+| 证据 | 时间 | 说明 |
+|---|---|---|
+| `hello.restore` / `hello.ise_ISE_Backup`（打开失败的"还原点"产物） | **23:29:32** | 补丁 **23:42+** 才写入磁盘 |
+| 补丁前用户会话 | ~23:29 | 工程打开失败（快失败 + 写还原点） |
+| 补丁后用户会话 | ~23:47 | 工程打开仍然报错 |
+
+结论：**工程打不开是第三个独立问题，先于补丁存在**；补丁既不是它的原因，也（尚未）成为它的解药。
+
+对卡死现场（`_pn.exe`，挂起 100s+）的测量：
+
+- 主线程栈：`win32u!NtUserGetMessage ← libQt_Qt（事件循环）← libPn_ProjectMgrPlugin+0xA6DB3/0xAC330`——主线程在**模态的 "Project Open" 进度对话框**里泵消息，等一个永远不来的异步完成信号；
+- 150ms 高频轮询 25 秒：**零子进程**；
+- `Get-NetTCPConnection`：**零网络连接**；
+- CPU ≈ 0，工作线程（含两个 `libtcl84` 线程）全部空闲等待。
+
+即：不是等子进程、不是等网络，是 ISE 工程管理插件内部的一条异步流水线根本没有产出结果。
+
+**补丁方案的取舍（记录一次失败尝试）**：曾试过更"保守"的改法——不改 `validate` 本体，改检查函数的失败分支（`0x10012EF5`），把 `exit(19)` 改成跳到 `0x10012F0B` 的"注册临时目录"序列。实测：按自然序列 `push esi; call 10047590` 落点，进程在 DLL 初始化阶段直接 `0xC0000142`；跳过 `push` 落在 `call` 上虽能启动，但工具进程会用一个垃圾指针注册临时目录，语义劣化。最终保留 **validate 桩**（`mov al,1; ret`）：所有候选目录都直接通过，工具进程以真实的 `TEMP` 目录注册，语义最干净。
+
+## 14. 现状清单（第三幕）
+
+| 项 | 状态 |
+|---|---|
+| GUI 启动（MPR 代理） | ✅ |
+| 工具启动（validate 桩） | ✅ `createsch` exit 0 + 正常 banner |
+| 工程打开 / 新建 | ❌ 第三问题，未解决（已排除子进程 / 网络 / CPU 因素） |
+| 备份与回退 | ✅ `libPortability.dll.orig` + `-Revert` 随时还原 |
+
+第三问题的下一步：给 `libPn_ProjectMgrPlugin` 的完成路径下断点、找一台"健康"机器对比、或读出 "Project Open" 进度对话框当前卡住的步骤文本。
+
 ## English TL;DR
 
 Xilinx ISE 9.2i (2007, 32-bit, VC7.1) starts fine up to Windows 10 1607 but hangs silently on later Win10 builds and all Windows 11: no window, no crash, no error code, near-zero CPU. We reproduced the hang, dumped the 32-bit thread stacks of the WOW64 process with a small `Wow64GetThreadContext`-based probe, and found the main thread blocked in `p9np!NPEnumResource` (the **Plan 9 Network Provider** used by WSL's `\\wsl$` file sharing — a component that did not exist in the 1607 era), called from `MPR!WNetEnumResourceA`, called by ISE's `libPortability.dll` which enumerates mapped network drives at startup. MPR invokes network providers sequentially with no timeout, so one deadlocked provider stalls the whole startup.
@@ -195,6 +229,8 @@ Xilinx ISE 9.2i (2007, 32-bit, VC7.1) starts fine up to Windows 10 1607 but hang
 Fix: place a tiny (40 KB) proxy `MPR.dll` in ISE's `bin\nt` directory. The Windows loader resolves static imports from the application directory before System32 (and `MPR.dll` is not a KnownDLL), so ISE loads the proxy, which fails the drive enumeration gracefully (`ERROR_NO_NETWORK` / `ERROR_NO_MORE_ITEMS`) — exactly what happens on machines without mapped network drives. No admin rights, no system changes, fully reversible; WSL keeps working everywhere else. Source in [`src/`](src/), binary in [Releases](../../releases), probe tool in [`tools/`](tools/).
 
 **Second act:** once the GUI starts, the ISE command-line tools (`createsch`, `sch2sym`, `asc2sch`, ...) still abort during process initialization with a bogus `Environment variable 'TEMP' not defined...` (exit code 19) — regardless of the actual TEMP value, and also without the MPR proxy. The temp-directory self-check inside `libPortability.dll` (validator at `0x10012820`: length → `GetFileAttributesExA` → `_stat` directory test → a `%s\xil_%d_%d` probe file) rejects perfectly valid directories when it runs in the tools' process-initialization context, while the very same DLL passes the check when loaded at runtime; raw Win32 file APIs are fine in a plain process. Fix: a signature-verified 3-byte patch (`mov al,1; ret`) to the validator, original kept as `libPortability.dll.orig` — see [`tools/patch_libportability.ps1`](tools/patch_libportability.ps1). After the patch all tools start normally and the GUI shows no regression.
+
+**Third act:** after both fixes, opening/creating any `.ise` project still fails with `ERROR:ProjectMgmt - A problem occurred while loading the project`. Timeline forensics settle the blame question: the failure's restore-point artifacts (`hello.restore`, `hello.ise_ISE_Backup`) carry mtimes 13 minutes **before** the patch existed, and the failure reproduces both with and without the patch — it is a third, pre-existing defect, not a regression. While stalled, the GUI main thread pumps messages inside the modal "Project Open" progress dialog (`libPn_ProjectMgrPlugin` → Qt nested event loop) waiting for an internal async completion that never arrives: no child process (150 ms polling), no TCP connection, near-zero CPU, all worker threads idle. Investigation ongoing; the MPR proxy and the validator patch remain necessary and revertible.
 
 ## 附录：关键地址速查
 
@@ -205,6 +241,10 @@ Fix: place a tiny (40 KB) proxy `MPR.dll` in ISE's `bin\nt` directory. The Windo
 | `libPortability+0x1565E` | call → `WNetCloseEnum` | 收尾 |
 | `MPR+0xEEFE` | `WNetEnumResourceA` | A→W 转发 |
 | `p9np+0xD82F` | `NPEnumResource` 内部 | 死锁等待处 |
+| `libPortability!validate` | `0x10012820` | 临时目录校验；3 字节桩落点（文件偏移同 RVA） |
+| `libPortability+0x12E77` | 检查函数 | TEMP→TMP→C:\TEMP→C:\TMP 逐个过 validate |
+| `libPortability+0x12EF5` | 检查函数失败分支 | `exit(19)` 前；保守改写方案的实验点 |
+| `libPortability+0x24B02` | `CreateProcessA` + `WaitForSingleObject` | 启动器等待子进程的辅助例程（返回地址 `+0x24B08`） |
 
 ---
 
