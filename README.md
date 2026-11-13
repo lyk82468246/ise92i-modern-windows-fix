@@ -9,6 +9,9 @@
 | **根因** | 新系统网络提供程序列表中新增的 **p9np.dll（Plan 9 Network Provider，WSL `\\wsl$` 文件共享）** 在 `NPEnumResource` 中永久阻塞；ISE 启动时经 MPR 枚举网络驱动器，被无限期卡住 |
 | **修复** | 在 ISE 的 `bin\nt` 目录放一个 40 KB 的 `MPR.dll` 代理（利用加载器"应用目录优先"的搜索顺序），让枚举按"无网络盘"优雅失败。无需管理员、不动原文件、不影响 WSL |
 | **验证** | 修复前 3 次启动全部挂起；修复后 `ise.exe` 秒起，弹出 `Xilinx - ISE` 主窗口与 `Tip of the Day`，含"无环境变量模拟双击"场景均通过 |
+| **现象②** | GUI 能启动后，命令行工具（`createsch`/`sch2sym`/`asc2sch`…）全部报 `Environment variable 'TEMP' not defined or points at a non-existant directory...`，退出码 19，连版本 banner 都打不出来 |
+| **根因②** | `libPortability.dll` 的临时目录"开机自检"在现代 Windows 的**工具进程初始化上下文**里对完全有效的目录误判（同一 DLL 运行时加载则自检通过；裸 Win32 文件 API 全部正常） |
+| **修复②** | 特征码校验后的 **3 字节补丁**（`mov al,1; ret`）让自检放行 `%TEMP%`；原文件备份为 `libPortability.dll.orig`，可一键还原。见 [`tools/patch_libportability.ps1`](tools/patch_libportability.ps1) |
 
 **TL;DR (English)**: Xilinx ISE 9.2i hangs silently on Windows 10 1903+ / Windows 11. Root cause: the WSL "Plan 9 Network Provider" (`p9np.dll`) deadlocks inside `NPEnumResource` when ISE enumerates mapped network drives via `WNetEnumResourceA` at startup; MPR calls providers sequentially with no timeout. Fix: drop a 40 KB proxy `MPR.dll` into ISE's `bin\nt` directory — the Windows loader prefers the application-directory copy over System32, the enumeration fails gracefully, and ISE starts. See [English TL;DR](#english-tldr) for details.
 
@@ -129,9 +132,10 @@ tid 38224  eip=ntdll+0x7837C (等待)
 
 ## 7. 使用方法
 
-1. 到 [Releases](../../releases) 下载 `MPR.dll`；
-2. 放进 ISE 9.2i 安装目录的 `bin\nt\` 下（与 `ise.exe` 同目录）；
-3. 正常启动 `ise.exe`。不喜欢了删掉该文件即完全还原，不影响系统与其他程序。
+1. 到 [Releases](../../releases) 下载 `MPR.dll`，放进 ISE 9.2i 安装目录的 `bin\nt\` 下（与 `ise.exe` 同目录）；
+2. 再运行 [`tools/patch_libportability.ps1`](tools/patch_libportability.ps1) 修复工具进程的 TEMP 自检：
+   `.\patch_libportability.ps1 -BinNt "C:\你的ISE安装目录\bin\nt"`；
+3. 正常启动 `ise.exe`。不满意随时完全还原：删掉 `MPR.dll`，并对脚本加 `-Revert` 参数。
 
 > 自己编译：安装 VS2008（或任何能出 32 位 x86 的 MSVC），运行 `build\build.bat`。
 
@@ -140,12 +144,57 @@ tid 38224  eip=ntdll+0x7837C (等待)
 1. **"跑不起来"先分诊**：崩（有错误码/WER）、退（有退出码）、挂（无窗口无输出）是三种病。挂起没有错误码，抓栈是最短路径。
 2. **WOW64 老进程抓栈**：`Wow64GetThreadContext` + EBP 链回溯 + Toolhelp 模块表，不装 WinDbg 也能十分钟定位到"卡在哪个系统组件"。
 3. **老程序 + 新系统，未必是地址冲突**：更多时候是"新组件插进了老代码的必经之路"。这次是网络提供程序，别的地方可能是字体、GDI、打印、IMM——思路都是找出那条必经之路，然后给它一个"优雅降级"的出口。
+4. **修复要选对"加载时机"**：同一份补丁逻辑，放进 MPR 代理的 DllMain 里对工具进程无效（MPR 在工具进程里加载得太晚甚至不加载），直接补在 `libPortability` 上才生效。代理适合"替换外部依赖的行为"，不适合"修它自己身上的代码"。
+5. **"报 TEMP 的错，未必是 TEMP 的问题"**：老程序的自检逻辑会把一堆内部失败统一翻译成一条模糊的用户提示。把提示里的每个字面量（TEMP 目录）都换成合法值再做一轮实验，往往就能把"环境问题"和"代码问题"切开。
+
+## 9. 第二幕：能启动了，"Creating Schematic" 却全体罢工
+
+故事并没有在主窗口弹出的那一刻结束。真正开始建工程时，"Creating Schematic" 一步失败，输出里出现：
+
+```text
+Environment variable 'TEMP' not defined or points at a non-existant directory
+or a non-writable directory. Please define it to a directory location for
+temporary files.
+```
+
+进程退出码 19。`bin\nt` 下的命令行工具（`createsch` / `sch2sym` / `asc2sch`……）**全军覆没**，连版本 banner 都来不及打印。第一反应当然是：是不是排查过程污染了环境？逐项排除：
+
+| 实验 | 结果 |
+|---|---|
+| 核对注册表 `HKCU\Environment` 的 TEMP/TMP | 从未被改动，目录存在可写 |
+| TEMP 指向不存在目录 / 指向新建的 `C:\TEMP` / 删除 TEMP / 恢复原值 | 四种状态**全部**报同样的错 |
+| 带上 `XILINX` + `PATH`（模拟 GUI 的启动环境） | 依旧失败 |
+| **移除 MPR.dll 代理做 A/B** | **依旧失败（且不挂起）** |
+| 不链接 CRT 的裸内核32程序里调 `GetFileAttributesExA` / `CreateFileA` 探针文件 | **全部成功** |
+
+结论：与环境无关、与代理无关、甚至与 TEMP 的值无关——连硬编码候选 `C:\TEMP`、`C:\TMP` 都被拒。**报 TEMP 的错，不是 TEMP 的问题。**
+
+## 10. 定位：libPortability 的"开机自检"
+
+反汇编 `libPortability.dll`，找到打印这条消息的检查函数（`0x10012E77`）：它依次尝试 `getenv("TEMP")` → `getenv("TMP")` → `"C:\TEMP"` → `"C:\TMP"`，每个候选都交给校验器 `validate`（`0x10012820`）：长度 ≤ 260 → `GetFileAttributesExA` → 非 READONLY → `_stat` 确认是目录 → 最后在目录里构造 `%s\xil_%d_%d` 探针文件验证可写。任何一环失败，统一打印 TEMP 消息并 `exit(19)`。
+
+最有意思的对照实验：写一个测试程序在**运行时** `LoadLibrary("libPortability.dll")`，它的初始化自检**能通过**；同一个 DLL 在 `createsch.exe` 里以**进程初始化（静态导入）**方式加载，自检**必失败**。同一份 DLL、同一个目录、同一台机器，差别只在加载时机与进程上下文——2007 年的自检逻辑在 2026 年的进程初始化序列里误判了。
+
+（顺带排除一条路线：把内存补丁塞进 MPR 代理的 DllMain 里去修 `libPortability`。但工具进程里 MPR 加载得太晚甚至根本不加载——代理能救 GUI 的启动，救不了工具的初始化。）
+
+## 11. 修复：3 个字节
+
+`validate` 的唯一职责就是这次自检。把它的序言（14 字节特征 `64 A1 00 00 00 00 6A FF 68 A4 F6 04 10 50`，含 SEH 注册）原地改成 `mov al,1; ret`（`B0 01 C3`）——校验器恒真，工具直接使用 `%TEMP%`。原始文件先备份为 `libPortability.dll.orig`；脚本只在特征码**唯一命中**时才动刀，支持 `-Status` / `-Revert`，随时还原。见 [`tools/patch_libportability.ps1`](tools/patch_libportability.ps1)。
+
+## 12. 第二幕验证
+
+| 项 | 修复前 | 修复后 |
+|---|---|---|
+| `createsch` / `sch2sym` / `asc2sch` | exit 19 + TEMP 消息 | exit 0，正常打印版本与 Usage |
+| `ise.exe` GUI | 正常 | 正常（无回归） |
 
 ## English TL;DR
 
 Xilinx ISE 9.2i (2007, 32-bit, VC7.1) starts fine up to Windows 10 1607 but hangs silently on later Win10 builds and all Windows 11: no window, no crash, no error code, near-zero CPU. We reproduced the hang, dumped the 32-bit thread stacks of the WOW64 process with a small `Wow64GetThreadContext`-based probe, and found the main thread blocked in `p9np!NPEnumResource` (the **Plan 9 Network Provider** used by WSL's `\\wsl$` file sharing — a component that did not exist in the 1607 era), called from `MPR!WNetEnumResourceA`, called by ISE's `libPortability.dll` which enumerates mapped network drives at startup. MPR invokes network providers sequentially with no timeout, so one deadlocked provider stalls the whole startup.
 
 Fix: place a tiny (40 KB) proxy `MPR.dll` in ISE's `bin\nt` directory. The Windows loader resolves static imports from the application directory before System32 (and `MPR.dll` is not a KnownDLL), so ISE loads the proxy, which fails the drive enumeration gracefully (`ERROR_NO_NETWORK` / `ERROR_NO_MORE_ITEMS`) — exactly what happens on machines without mapped network drives. No admin rights, no system changes, fully reversible; WSL keeps working everywhere else. Source in [`src/`](src/), binary in [Releases](../../releases), probe tool in [`tools/`](tools/).
+
+**Second act:** once the GUI starts, the ISE command-line tools (`createsch`, `sch2sym`, `asc2sch`, ...) still abort during process initialization with a bogus `Environment variable 'TEMP' not defined...` (exit code 19) — regardless of the actual TEMP value, and also without the MPR proxy. The temp-directory self-check inside `libPortability.dll` (validator at `0x10012820`: length → `GetFileAttributesExA` → `_stat` directory test → a `%s\xil_%d_%d` probe file) rejects perfectly valid directories when it runs in the tools' process-initialization context, while the very same DLL passes the check when loaded at runtime; raw Win32 file APIs are fine in a plain process. Fix: a signature-verified 3-byte patch (`mov al,1; ret`) to the validator, original kept as `libPortability.dll.orig` — see [`tools/patch_libportability.ps1`](tools/patch_libportability.ps1). After the patch all tools start normally and the GUI shows no regression.
 
 ## 附录：关键地址速查
 
