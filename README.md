@@ -11,7 +11,9 @@
 | **验证** | 修复前 3 次启动全部挂起；修复后 `ise.exe` 秒起，弹出 `Xilinx - ISE` 主窗口与 `Tip of the Day`，含"无环境变量模拟双击"场景均通过 |
 | **现象②** | GUI 能启动后，命令行工具（`createsch`/`sch2sym`/`asc2sch`…）全部报 `Environment variable 'TEMP' not defined or points at a non-existant directory...`，退出码 19，连版本 banner 都打不出来 |
 | **根因②** | `libPortability.dll` 的临时目录"开机自检"在现代 Windows 的**工具进程初始化上下文**里对完全有效的目录误判（同一 DLL 运行时加载则自检通过；裸 Win32 文件 API 全部正常） |
-| **修复②** | 特征码校验后的 **3 字节补丁**（`mov al,1; ret`）让自检放行 `%TEMP%`；原文件备份为 `libPortability.dll.orig`，可一键还原。见 [`tools/patch_libportability.ps1`](tools/patch_libportability.ps1) |
+| **修复②（已撤回）** | ~~特征码校验后的 3 字节补丁~~ —— **v1.0.1 已撤回，属失败探索**：补丁只能让工具进程启动，解决不了工程创建/打开。详见[第 15 节撤回说明](#15-v101-撤回说明一次失败的探索)。请改用 v1.0.0，并遵循[第 7 节的工程目录建议](#7-使用方法与工程目录建议重要) |
+
+> **⚠️ v1.0.1 已撤回（失败探索）**：该版本中的 3 字节 `libPortability` 补丁只能让工具进程启动，无法解决工程创建/打开的问题，已从 Releases 撤回。仓库保留全部排查记录（第二、三幕）供参考。**当前请使用 v1.0.0（仅 MPR.dll 代理，不改任何原文件）**，并按[第 7 节](#7-使用方法与工程目录建议重要)的建议把工程建在 `C:\Digital` 这类普通目录下。
 
 **TL;DR (English)**: Xilinx ISE 9.2i hangs silently on Windows 10 1903+ / Windows 11. Root cause: the WSL "Plan 9 Network Provider" (`p9np.dll`) deadlocks inside `NPEnumResource` when ISE enumerates mapped network drives via `WNetEnumResourceA` at startup; MPR calls providers sequentially with no timeout. Fix: drop a 40 KB proxy `MPR.dll` into ISE's `bin\nt` directory — the Windows loader prefers the application-directory copy over System32, the enumeration fails gracefully, and ISE starts. See [English TL;DR](#english-tldr) for details.
 
@@ -130,14 +132,24 @@ tid 38224  eip=ntdll+0x7837C (等待)
 ![ISE 9.2i 主窗口在 Win11 上启动成功](screenshots/ise-main-window.png)
 ![Tip of the Day](screenshots/ise-tip-of-the-day.png)
 
-## 7. 使用方法
+## 7. 使用方法与工程目录建议（重要）
 
 1. 到 [Releases](../../releases) 下载 `MPR.dll`，放进 ISE 9.2i 安装目录的 `bin\nt\` 下（与 `ise.exe` 同目录）；
-2. 再运行 [`tools/patch_libportability.ps1`](tools/patch_libportability.ps1) 修复工具进程的 TEMP 自检：
-   `.\patch_libportability.ps1 -BinNt "C:\你的ISE安装目录\bin\nt"`；
-3. 正常启动 `ise.exe`。不满意随时完全还原：删掉 `MPR.dll`，并对脚本加 `-Revert` 参数。
+2. 正常启动 `ise.exe`。代理不修改任何原文件，不满意删掉 `MPR.dll` 即可完全还原。
 
 > 自己编译：安装 VS2008（或任何能出 32 位 x86 的 MSVC），运行 `build\build.bat`。
+
+### 工程目录务必避开"桌面/文档"这类特殊文件夹
+
+在较新的 Windows 11 上（含全新安装的机器），把 ISE 工程建在**桌面、文档**这类"已知文件夹"里，创建/打开工程时会报**目录只读**错误；而把工程建在 `AppData\Local\Temp` 下则完全正常。原因：这些特殊目录（常见于被 OneDrive"已知文件夹备份"接管后）无法通过 ISE 老式校验里的目录属性写入测试，被误判为只读。
+
+**推荐做法：在 C 盘根目录专门建一个普通文件夹放实验工程**：
+
+```bat
+mkdir C:\Digital
+```
+
+之后所有 `.ise` 工程都建在 `C:\Digital\` 下，即可绕开该问题。`AppData\Local\Temp` 下也已实测可用。
 
 ## 8. 复盘：三条通用经验
 
@@ -211,16 +223,28 @@ temporary files.
 
 **补丁方案的取舍（记录一次失败尝试）**：曾试过更"保守"的改法——不改 `validate` 本体，改检查函数的失败分支（`0x10012EF5`），把 `exit(19)` 改成跳到 `0x10012F0B` 的"注册临时目录"序列。实测：按自然序列 `push esi; call 10047590` 落点，进程在 DLL 初始化阶段直接 `0xC0000142`；跳过 `push` 落在 `call` 上虽能启动，但工具进程会用一个垃圾指针注册临时目录，语义劣化。最终保留 **validate 桩**（`mov al,1; ret`）：所有候选目录都直接通过，工具进程以真实的 `TEMP` 目录注册，语义最干净。
 
-## 14. 现状清单（第三幕）
+## 14. 现状清单（第三幕收官）
 
 | 项 | 状态 |
 |---|---|
 | GUI 启动（MPR 代理） | ✅ |
-| 工具启动（validate 桩） | ✅ `createsch` exit 0 + 正常 banner |
-| 工程打开 / 新建 | ❌ 第三问题，未解决（已排除子进程 / 网络 / CPU 因素） |
-| 备份与回退 | ✅ `libPortability.dll.orig` + `-Revert` 随时还原 |
+| 工程打开 / 新建 | ✅ **已解决——把工程放进普通目录（如 `C:\Digital`）即可**；"只读"报错源于桌面/文档这类特殊文件夹过不了 ISE 的目录属性写测试 |
+| 工具启动（validate 桩） | ⚠️ 已撤回：桩能让工具启动，但无助于工程问题，且属于对原文件的侵入式修改 |
+| 备份与回退 | ✅ 代理方案零修改原文件，删掉 `MPR.dll` 即还原 |
 
-第三问题的下一步：给 `libPn_ProjectMgrPlugin` 的完成路径下断点、找一台"健康"机器对比、或读出 "Project Open" 进度对话框当前卡住的步骤文本。
+**第三幕的最终结论**：在全新 Win11 机器上仅用 v1.0.0（MPR 代理）复现实验——工程建在桌面/文档报"只读"，建在 `AppData\Local\Temp` 则创建/打开全部正常。所谓"第三问题"并不是代码缺陷，而是**工程选址踩进了现代 Windows 的特殊文件夹**。此前怀疑的异步流水线卡死等现象，是选址问题在不同目录上的另一种表现。
+
+原机器上另记录到一个**独立于上述问题**的本地异常（探测 `_open` 返回 -1 且 Win32 LastError=0，疑似进程初始化上下文破坏 CRT 内部状态），与目录选址无关，仍在排查中；在干净机器上不存在此问题。
+
+## 15. v1.0.1 撤回说明（一次失败的探索）
+
+**v1.0.1 已从 Releases 撤回**，原因如实记录：
+
+- v1.0.1 的 3 字节 `libPortability` 补丁（`validate` 桩）只能让工具进程通过 TEMP 自检并启动；
+- 它**解决不了**工程创建/打开的问题（该问题的真正原因是工程目录选址，见第 7、14 节）；
+- 后续在真实进程里的深挖（硬件断点追踪）表明，工具进程初始化上下文中还存在更底层的 CRT 状态异常，3 字节桩属于"绕过症状"而非"修复病因"，属于**失败探索**。
+
+本仓库保留第二、三幕的全部排查记录与该补丁的源码（[`tools/patch_libportability.ps1`](tools/patch_libportability.ps1)），仅作排查方法论存档。**请使用 v1.0.0**。
 
 ## English TL;DR
 
@@ -230,7 +254,7 @@ Fix: place a tiny (40 KB) proxy `MPR.dll` in ISE's `bin\nt` directory. The Windo
 
 **Second act:** once the GUI starts, the ISE command-line tools (`createsch`, `sch2sym`, `asc2sch`, ...) still abort during process initialization with a bogus `Environment variable 'TEMP' not defined...` (exit code 19) — regardless of the actual TEMP value, and also without the MPR proxy. The temp-directory self-check inside `libPortability.dll` (validator at `0x10012820`: length → `GetFileAttributesExA` → `_stat` directory test → a `%s\xil_%d_%d` probe file) rejects perfectly valid directories when it runs in the tools' process-initialization context, while the very same DLL passes the check when loaded at runtime; raw Win32 file APIs are fine in a plain process. Fix: a signature-verified 3-byte patch (`mov al,1; ret`) to the validator, original kept as `libPortability.dll.orig` — see [`tools/patch_libportability.ps1`](tools/patch_libportability.ps1). After the patch all tools start normally and the GUI shows no regression.
 
-**Third act:** after both fixes, opening/creating any `.ise` project still fails with `ERROR:ProjectMgmt - A problem occurred while loading the project`. Timeline forensics settle the blame question: the failure's restore-point artifacts (`hello.restore`, `hello.ise_ISE_Backup`) carry mtimes 13 minutes **before** the patch existed, and the failure reproduces both with and without the patch — it is a third, pre-existing defect, not a regression. While stalled, the GUI main thread pumps messages inside the modal "Project Open" progress dialog (`libPn_ProjectMgrPlugin` → Qt nested event loop) waiting for an internal async completion that never arrives: no child process (150 ms polling), no TCP connection, near-zero CPU, all worker threads idle. Investigation ongoing; the MPR proxy and the validator patch remain necessary and revertible.
+**Third act (resolved):** after both fixes, opening/creating any `.ise` project still failed with `ERROR:ProjectMgmt - A problem occurred while loading the project`. A control experiment on a freshly installed Windows 11 machine (v1.0.0 proxy only) settled it: projects created under **Desktop/Documents** fail as "read-only", while projects under **AppData\Local\Temp** work perfectly. The "third defect" was never a code defect — ISE 9.2i's old-fashioned directory validation (attribute write-test via `SetFileAttributesA`) rejects the modern special user folders (typically OneDrive known-folder-backup targets). **Put your projects in a plain folder, e.g. `C:\Digital`.** The 3-byte validator patch (v1.0.1) has been **withdrawn** as a failed exploration: it only lets the tools start and does not address the real issue; v1.0.0 (MPR proxy only, zero modification to original files) is the recommended release.
 
 ## 附录：关键地址速查
 
@@ -245,6 +269,12 @@ Fix: place a tiny (40 KB) proxy `MPR.dll` in ISE's `bin\nt` directory. The Windo
 | `libPortability+0x12E77` | 检查函数 | TEMP→TMP→C:\TEMP→C:\TMP 逐个过 validate |
 | `libPortability+0x12EF5` | 检查函数失败分支 | `exit(19)` 前；保守改写方案的实验点 |
 | `libPortability+0x24B02` | `CreateProcessA` + `WaitForSingleObject` | 启动器等待子进程的辅助例程（返回地址 `+0x24B08`） |
+
+## 附录 B：软件来源与用途声明
+
+- ISE 9.2i 原版安装包下载地址：<https://ee.fudan.edu.cn/electron/Data/List/sxlj>
+- 本仓库只包含兼容性修复的说明、探针脚本与 `MPR.dll` 代理源码，**不包含、也不分发** ISE 安装包或任何 Xilinx 二进制文件。
+- **用途声明：仅用于学习与研究。** 资源收集于网络，软件版权归 Xilinx（现 AMD）所有，请遵守当地法律与许可条款。
 
 ---
 
